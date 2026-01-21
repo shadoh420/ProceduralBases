@@ -1,15 +1,13 @@
 """
-FPSZ Procedural Base Generator v4 - Form-First Approach
-=========================================================
-Generates Tribes-style bases by starting with the EXTERIOR FORM
-and carving interior spaces, rather than assembling boxes.
-
-Key Tribes base characteristics:
-- Tapered/sloped exterior walls (pyramidal forms)
-- Central open atrium with platforms at multiple levels
-- Integrated ramps (interior and exterior)
-- Balconies and overhangs
-- One unified structure, not separate rooms
+FPSZ Procedural Base Generator v5 - Complex Interiors
+======================================================
+Keeps the tapered exterior forms from v4 but generates
+much more complex interior spaces:
+- Multiple rooms at each level
+- Corridors connecting rooms
+- Side chambers and alcoves
+- Equipment/objective rooms
+- Multiple routes through the base
 
 Run in Blender 4.x with Alt+P
 """
@@ -19,7 +17,7 @@ import bmesh
 from mathutils import Vector
 import math
 import random
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -29,11 +27,33 @@ from enum import Enum
 # =============================================================================
 
 class BaseStyle(Enum):
-    """Different Tribes base architectural styles."""
-    PYRAMID = "pyramid"           # Classic tapered pyramid
-    STEPPED_PYRAMID = "stepped"   # Stepped/terraced pyramid
-    TOWER_ON_BASE = "tower"       # Tower sitting on wider base
-    BUNKER = "bunker"             # Low, wide, fortified
+    PYRAMID = "pyramid"
+    STEPPED_PYRAMID = "stepped"
+    TOWER_ON_BASE = "tower"
+
+
+class RoomType(Enum):
+    MAIN_HALL = "main_hall"          # Large central space
+    CORRIDOR = "corridor"             # Connecting passage
+    SIDE_CHAMBER = "side_chamber"     # Medium room off main areas
+    EQUIPMENT_ROOM = "equipment"      # Small equipment/objective room
+    STAIRWELL = "stairwell"           # Vertical connection space
+    BALCONY = "balcony"               # Overlook area
+
+
+@dataclass
+class Room:
+    """Interior room definition."""
+    id: int
+    room_type: RoomType
+    x: float
+    y: float
+    z: float
+    width: float
+    depth: float
+    height: float
+    level: int
+    connections: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -41,36 +61,39 @@ class Config:
     """Base generation configuration."""
     
     # Overall size
-    base_width: float = 64.0          # Base footprint width
-    base_depth: float = 64.0          # Base footprint depth
-    base_height: float = 48.0         # Total height
+    base_width: float = 70.0
+    base_depth: float = 70.0
+    base_height: float = 55.0
     
-    # Taper (0 = vertical walls, 0.5 = 45 degree slope)
-    wall_taper: float = 0.3           # How much walls slope inward
+    # Taper
+    wall_taper: float = 0.25
     
-    # Interior
-    wall_thickness: float = 4.0       # Thickness of exterior walls
+    # Structure
+    wall_thickness: float = 3.0
     floor_thickness: float = 1.0
+    interior_wall_thickness: float = 1.5
     
     # Levels
-    num_levels: int = 4               # Interior floor levels
-    level_height: float = 10.0        # Height per level
+    num_levels: int = 4
+    level_height: float = 12.0
     
-    # Central atrium (open vertical space)
-    atrium_width: float = 20.0
-    atrium_depth: float = 20.0
+    # Rooms per level
+    rooms_per_level: int = 4
     
-    # Platforms/balconies
-    platform_width: float = 8.0
-    platform_depth: float = 12.0
-    
-    # Ramps
-    ramp_width: float = 8.0
-    ramp_angle: float = 30.0          # Degrees
+    # Room sizes (from Tribes analysis)
+    main_hall_size: Tuple[float, float] = (24.0, 24.0)
+    corridor_width: float = 8.0
+    corridor_length: float = 16.0
+    side_chamber_size: Tuple[float, float] = (14.0, 12.0)
+    equipment_room_size: Tuple[float, float] = (8.0, 8.0)
     
     # Doorways
-    doorway_width: float = 8.0
-    doorway_height: float = 9.0
+    doorway_width: float = 6.0
+    doorway_height: float = 8.0
+    
+    # Ramps
+    ramp_width: float = 6.0
+    ramp_angle: float = 28.0
     
     # Entrances
     num_entrances: int = 2
@@ -80,222 +103,556 @@ class Config:
     # Style
     style: BaseStyle = BaseStyle.PYRAMID
     
-    # Random seed
+    # Seed
     seed: int = 42
 
 
 # =============================================================================
-# MESH BUILDER WITH CSG-LIKE OPERATIONS
+# INTERIOR LAYOUT GENERATOR
+# =============================================================================
+
+class InteriorLayout:
+    """Generates complex interior room layouts."""
+    
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.rooms: List[Room] = []
+        self.room_id_counter = 0
+        self.rng = random.Random(cfg.seed)
+    
+    def generate_layout(self) -> List[Room]:
+        """Generate complete interior layout."""
+        
+        for level in range(self.cfg.num_levels):
+            self._generate_level(level)
+        
+        self._create_vertical_connections()
+        
+        return self.rooms
+    
+    def _generate_level(self, level: int):
+        """Generate rooms for one level."""
+        z = level * self.cfg.level_height + self.cfg.floor_thickness
+        
+        # Calculate available interior space at this level
+        height_ratio = z / self.cfg.base_height
+        taper = self.cfg.base_height * self.cfg.wall_taper * height_ratio
+        
+        available_width = self.cfg.base_width - self.cfg.wall_thickness * 2 - taper * 2
+        available_depth = self.cfg.base_depth - self.cfg.wall_thickness * 2 - taper * 2
+        
+        if level == 0:
+            # Ground floor: main hall + side rooms + corridors
+            self._generate_ground_floor(z, available_width, available_depth, level)
+        elif level == self.cfg.num_levels - 1:
+            # Top floor: smaller control room + balconies
+            self._generate_top_floor(z, available_width, available_depth, level)
+        else:
+            # Middle floors: varied room layouts
+            self._generate_middle_floor(z, available_width, available_depth, level)
+    
+    def _generate_ground_floor(self, z: float, avail_w: float, avail_d: float, level: int):
+        """Ground floor with main hall and branching corridors."""
+        
+        # Central main hall
+        hall_w, hall_d = self.cfg.main_hall_size
+        main_hall = self._add_room(
+            RoomType.MAIN_HALL, 0, 0, z,
+            hall_w, hall_d, self.cfg.level_height - 1,
+            level
+        )
+        
+        # North corridor
+        corridor_n = self._add_room(
+            RoomType.CORRIDOR, 0, hall_d/2 + self.cfg.corridor_length/2, z,
+            self.cfg.corridor_width, self.cfg.corridor_length, self.cfg.level_height - 1,
+            level
+        )
+        main_hall.connections.append(corridor_n.id)
+        corridor_n.connections.append(main_hall.id)
+        
+        # South corridor
+        corridor_s = self._add_room(
+            RoomType.CORRIDOR, 0, -(hall_d/2 + self.cfg.corridor_length/2), z,
+            self.cfg.corridor_width, self.cfg.corridor_length, self.cfg.level_height - 1,
+            level
+        )
+        main_hall.connections.append(corridor_s.id)
+        corridor_s.connections.append(main_hall.id)
+        
+        # East side chamber
+        chamber_e = self._add_room(
+            RoomType.SIDE_CHAMBER, 
+            hall_w/2 + self.cfg.side_chamber_size[0]/2 + 2, 0, z,
+            self.cfg.side_chamber_size[0], self.cfg.side_chamber_size[1], 
+            self.cfg.level_height - 1,
+            level
+        )
+        main_hall.connections.append(chamber_e.id)
+        chamber_e.connections.append(main_hall.id)
+        
+        # West side chamber
+        chamber_w = self._add_room(
+            RoomType.SIDE_CHAMBER,
+            -(hall_w/2 + self.cfg.side_chamber_size[0]/2 + 2), 0, z,
+            self.cfg.side_chamber_size[0], self.cfg.side_chamber_size[1],
+            self.cfg.level_height - 1,
+            level
+        )
+        main_hall.connections.append(chamber_w.id)
+        chamber_w.connections.append(main_hall.id)
+        
+        # Equipment rooms at corridor ends
+        equip_n = self._add_room(
+            RoomType.EQUIPMENT_ROOM,
+            0, hall_d/2 + self.cfg.corridor_length + self.cfg.equipment_room_size[1]/2 + 1, z,
+            self.cfg.equipment_room_size[0], self.cfg.equipment_room_size[1],
+            self.cfg.level_height - 2,
+            level
+        )
+        corridor_n.connections.append(equip_n.id)
+        equip_n.connections.append(corridor_n.id)
+        
+        equip_s = self._add_room(
+            RoomType.EQUIPMENT_ROOM,
+            0, -(hall_d/2 + self.cfg.corridor_length + self.cfg.equipment_room_size[1]/2 + 1), z,
+            self.cfg.equipment_room_size[0], self.cfg.equipment_room_size[1],
+            self.cfg.level_height - 2,
+            level
+        )
+        corridor_s.connections.append(equip_s.id)
+        equip_s.connections.append(corridor_s.id)
+        
+        # Corner equipment rooms
+        corner_offset = hall_w/2 + 8
+        for cx, cy in [(corner_offset, corner_offset), (corner_offset, -corner_offset),
+                       (-corner_offset, corner_offset), (-corner_offset, -corner_offset)]:
+            if abs(cx) < avail_w/2 - 4 and abs(cy) < avail_d/2 - 4:
+                corner_room = self._add_room(
+                    RoomType.EQUIPMENT_ROOM, cx, cy, z,
+                    self.cfg.equipment_room_size[0] * 0.9,
+                    self.cfg.equipment_room_size[1] * 0.9,
+                    self.cfg.level_height - 2,
+                    level
+                )
+                # Connect to nearest chamber
+                if cx > 0:
+                    chamber_e.connections.append(corner_room.id)
+                    corner_room.connections.append(chamber_e.id)
+                else:
+                    chamber_w.connections.append(corner_room.id)
+                    corner_room.connections.append(chamber_w.id)
+    
+    def _generate_middle_floor(self, z: float, avail_w: float, avail_d: float, level: int):
+        """Middle floors with ring corridor and side rooms."""
+        
+        # Central open area (atrium void - no floor here)
+        atrium_size = min(16, avail_w * 0.3)
+        
+        # Ring corridor around atrium
+        ring_width = 7
+        ring_inner = atrium_size / 2 + 1
+        ring_outer = ring_inner + ring_width
+        
+        # Four corridor segments forming a ring
+        # North segment
+        corridor_n = self._add_room(
+            RoomType.CORRIDOR, 0, ring_inner + ring_width/2, z,
+            ring_outer * 1.8, ring_width, self.cfg.level_height - 1,
+            level
+        )
+        
+        # South segment
+        corridor_s = self._add_room(
+            RoomType.CORRIDOR, 0, -(ring_inner + ring_width/2), z,
+            ring_outer * 1.8, ring_width, self.cfg.level_height - 1,
+            level
+        )
+        
+        # East segment
+        corridor_e = self._add_room(
+            RoomType.CORRIDOR, ring_inner + ring_width/2, 0, z,
+            ring_width, ring_outer * 1.8, self.cfg.level_height - 1,
+            level
+        )
+        
+        # West segment
+        corridor_w = self._add_room(
+            RoomType.CORRIDOR, -(ring_inner + ring_width/2), 0, z,
+            ring_width, ring_outer * 1.8, self.cfg.level_height - 1,
+            level
+        )
+        
+        # Connect ring segments
+        corridor_n.connections.extend([corridor_e.id, corridor_w.id])
+        corridor_s.connections.extend([corridor_e.id, corridor_w.id])
+        corridor_e.connections.extend([corridor_n.id, corridor_s.id])
+        corridor_w.connections.extend([corridor_n.id, corridor_s.id])
+        
+        # Side chambers off the ring
+        chamber_offset = ring_outer + self.cfg.side_chamber_size[0]/2 + 2
+        
+        if chamber_offset < avail_w/2 - 3:
+            # North-East chamber
+            ch_ne = self._add_room(
+                RoomType.SIDE_CHAMBER, chamber_offset * 0.7, chamber_offset * 0.7, z,
+                self.cfg.side_chamber_size[0] * 0.85, self.cfg.side_chamber_size[1] * 0.85,
+                self.cfg.level_height - 1, level
+            )
+            corridor_n.connections.append(ch_ne.id)
+            corridor_e.connections.append(ch_ne.id)
+            ch_ne.connections.extend([corridor_n.id, corridor_e.id])
+            
+            # North-West chamber
+            ch_nw = self._add_room(
+                RoomType.SIDE_CHAMBER, -chamber_offset * 0.7, chamber_offset * 0.7, z,
+                self.cfg.side_chamber_size[0] * 0.85, self.cfg.side_chamber_size[1] * 0.85,
+                self.cfg.level_height - 1, level
+            )
+            corridor_n.connections.append(ch_nw.id)
+            corridor_w.connections.append(ch_nw.id)
+            ch_nw.connections.extend([corridor_n.id, corridor_w.id])
+            
+            # South-East chamber
+            ch_se = self._add_room(
+                RoomType.SIDE_CHAMBER, chamber_offset * 0.7, -chamber_offset * 0.7, z,
+                self.cfg.side_chamber_size[0] * 0.85, self.cfg.side_chamber_size[1] * 0.85,
+                self.cfg.level_height - 1, level
+            )
+            corridor_s.connections.append(ch_se.id)
+            corridor_e.connections.append(ch_se.id)
+            ch_se.connections.extend([corridor_s.id, corridor_e.id])
+            
+            # South-West chamber
+            ch_sw = self._add_room(
+                RoomType.SIDE_CHAMBER, -chamber_offset * 0.7, -chamber_offset * 0.7, z,
+                self.cfg.side_chamber_size[0] * 0.85, self.cfg.side_chamber_size[1] * 0.85,
+                self.cfg.level_height - 1, level
+            )
+            corridor_s.connections.append(ch_sw.id)
+            corridor_w.connections.append(ch_sw.id)
+            ch_sw.connections.extend([corridor_s.id, corridor_w.id])
+    
+    def _generate_top_floor(self, z: float, avail_w: float, avail_d: float, level: int):
+        """Top floor with command room and balconies."""
+        
+        # Central command/objective room
+        cmd_size = min(18, avail_w * 0.5)
+        command_room = self._add_room(
+            RoomType.MAIN_HALL, 0, 0, z,
+            cmd_size, cmd_size, self.cfg.level_height,
+            level
+        )
+        
+        # Balconies extending outward
+        balcony_width = 5
+        balcony_length = 12
+        
+        # North balcony
+        if cmd_size/2 + balcony_length < avail_d/2 - 2:
+            bal_n = self._add_room(
+                RoomType.BALCONY, 0, cmd_size/2 + balcony_length/2, z,
+                balcony_width * 1.5, balcony_length, self.cfg.level_height,
+                level
+            )
+            command_room.connections.append(bal_n.id)
+            bal_n.connections.append(command_room.id)
+        
+        # South balcony
+        if cmd_size/2 + balcony_length < avail_d/2 - 2:
+            bal_s = self._add_room(
+                RoomType.BALCONY, 0, -(cmd_size/2 + balcony_length/2), z,
+                balcony_width * 1.5, balcony_length, self.cfg.level_height,
+                level
+            )
+            command_room.connections.append(bal_s.id)
+            bal_s.connections.append(command_room.id)
+        
+        # Side alcoves
+        alcove_offset = cmd_size/2 + 6
+        if alcove_offset < avail_w/2 - 4:
+            alcove_e = self._add_room(
+                RoomType.EQUIPMENT_ROOM, alcove_offset, 0, z,
+                8, 10, self.cfg.level_height - 1,
+                level
+            )
+            command_room.connections.append(alcove_e.id)
+            alcove_e.connections.append(command_room.id)
+            
+            alcove_w = self._add_room(
+                RoomType.EQUIPMENT_ROOM, -alcove_offset, 0, z,
+                8, 10, self.cfg.level_height - 1,
+                level
+            )
+            command_room.connections.append(alcove_w.id)
+            alcove_w.connections.append(command_room.id)
+    
+    def _create_vertical_connections(self):
+        """Mark rooms that should have vertical connections (ramps/stairs)."""
+        # Find rooms at similar XY positions on adjacent levels
+        for room in self.rooms:
+            for other in self.rooms:
+                if other.level == room.level + 1:
+                    # Check if roughly above
+                    dx = abs(room.x - other.x)
+                    dy = abs(room.y - other.y)
+                    if dx < 8 and dy < 8:
+                        if other.id not in room.connections:
+                            room.connections.append(other.id)
+                        if room.id not in other.connections:
+                            other.connections.append(room.id)
+    
+    def _add_room(self, room_type: RoomType, x: float, y: float, z: float,
+                  width: float, depth: float, height: float, level: int) -> Room:
+        """Add a room to the layout."""
+        room = Room(
+            id=self.room_id_counter,
+            room_type=room_type,
+            x=x, y=y, z=z,
+            width=width, depth=depth, height=height,
+            level=level
+        )
+        self.rooms.append(room)
+        self.room_id_counter += 1
+        return room
+
+
+# =============================================================================
+# MESH BUILDER
 # =============================================================================
 
 class MeshBuilder:
-    """Builds base geometry using additive/subtractive approach."""
+    """Builds geometry with hollow rooms."""
     
     def __init__(self, name: str):
         self.name = name
         self.bm = bmesh.new()
     
-    # =========================================================================
-    # PRIMITIVE SHAPES
-    # =========================================================================
+    def add_tapered_shell(self, 
+                          base_w: float, base_d: float,
+                          top_w: float, top_d: float,
+                          height: float,
+                          wall_thick: float,
+                          base_z: float = 0.0):
+        """Create a hollow tapered shell (exterior walls only)."""
+        
+        # Outer shell
+        self._add_tapered_box_faces(
+            base_w, base_d, top_w, top_d, height, base_z, invert=False
+        )
+        
+        # Inner shell (slightly smaller)
+        inner_base_w = base_w - wall_thick * 2
+        inner_base_d = base_d - wall_thick * 2
+        inner_top_w = top_w - wall_thick * 2
+        inner_top_d = top_d - wall_thick * 2
+        
+        self._add_tapered_box_faces(
+            inner_base_w, inner_base_d, 
+            inner_top_w, inner_top_d,
+            height, base_z, invert=True
+        )
     
-    def add_tapered_box(self, 
-                        base_width: float, base_depth: float,
-                        top_width: float, top_depth: float,
-                        height: float,
-                        center: Vector = None,
-                        base_z: float = 0.0) -> List:
-        """
-        Add a tapered box (frustum) - wider at bottom, narrower at top.
-        This is the core shape for Tribes-style sloped walls.
-        """
-        if center is None:
-            center = Vector((0, 0, 0))
+    def _add_tapered_box_faces(self, base_w, base_d, top_w, top_d, height, base_z, invert=False):
+        """Add faces for a tapered box."""
+        bw, bd = base_w / 2, base_d / 2
+        tw, td = top_w / 2, top_d / 2
+        z0, z1 = base_z, base_z + height
         
-        cx, cy = center.x, center.y
-        z0 = base_z
-        z1 = base_z + height
-        
-        # Bottom vertices (wider)
-        bw, bd = base_width / 2, base_depth / 2
-        # Top vertices (narrower)
-        tw, td = top_width / 2, top_depth / 2
-        
-        # Create vertices
         v_bottom = [
-            self.bm.verts.new((cx - bw, cy - bd, z0)),
-            self.bm.verts.new((cx + bw, cy - bd, z0)),
-            self.bm.verts.new((cx + bw, cy + bd, z0)),
-            self.bm.verts.new((cx - bw, cy + bd, z0)),
+            self.bm.verts.new((-bw, -bd, z0)),
+            self.bm.verts.new((bw, -bd, z0)),
+            self.bm.verts.new((bw, bd, z0)),
+            self.bm.verts.new((-bw, bd, z0)),
         ]
         
         v_top = [
-            self.bm.verts.new((cx - tw, cy - td, z1)),
-            self.bm.verts.new((cx + tw, cy - td, z1)),
-            self.bm.verts.new((cx + tw, cy + td, z1)),
-            self.bm.verts.new((cx - tw, cy + td, z1)),
+            self.bm.verts.new((-tw, -td, z1)),
+            self.bm.verts.new((tw, -td, z1)),
+            self.bm.verts.new((tw, td, z1)),
+            self.bm.verts.new((-tw, td, z1)),
         ]
         
-        # Bottom face
-        self.bm.faces.new(v_bottom[::-1])
-        
-        # Top face
-        self.bm.faces.new(v_top)
-        
-        # Side faces (sloped walls)
-        for i in range(4):
-            ni = (i + 1) % 4
-            self.bm.faces.new([v_bottom[i], v_bottom[ni], v_top[ni], v_top[i]])
-        
-        return v_bottom + v_top
+        if invert:
+            self.bm.faces.new(v_bottom)
+            self.bm.faces.new(v_top[::-1])
+            for i in range(4):
+                ni = (i + 1) % 4
+                self.bm.faces.new([v_top[i], v_top[ni], v_bottom[ni], v_bottom[i]])
+        else:
+            self.bm.faces.new(v_bottom[::-1])
+            self.bm.faces.new(v_top)
+            for i in range(4):
+                ni = (i + 1) % 4
+                self.bm.faces.new([v_bottom[i], v_bottom[ni], v_top[ni], v_top[i]])
     
-    def add_platform(self, 
-                     x: float, y: float, z: float,
-                     width: float, depth: float, 
-                     thickness: float = 1.0):
-        """Add a horizontal platform/floor section."""
-        hw, hd = width / 2, depth / 2
+    def add_room_geometry(self, room: Room, wall_thick: float = 1.0):
+        """
+        Create floor and walls for a room.
+        Rooms are hollow boxes with no ceiling (open to above).
+        """
+        x, y, z = room.x, room.y, room.z
+        w, d, h = room.width, room.depth, room.height
+        hw, hd = w / 2, d / 2
+        
+        # Floor
+        self._add_floor(x, y, z, w, d, 1.0)
+        
+        # Walls (partial, with gaps for doorways)
+        # For simplicity, create corner pillars and partial walls
+        pillar_size = wall_thick * 2
+        
+        # Corner pillars
+        corners = [
+            (x - hw + pillar_size/2, y - hd + pillar_size/2),
+            (x + hw - pillar_size/2, y - hd + pillar_size/2),
+            (x + hw - pillar_size/2, y + hd - pillar_size/2),
+            (x - hw + pillar_size/2, y + hd - pillar_size/2),
+        ]
+        
+        for cx, cy in corners:
+            self._add_box(cx, cy, z, pillar_size, pillar_size, h)
+        
+        # Wall segments between pillars (with doorway gaps)
+        doorway_width = 6.0
+        
+        # North and South walls
+        wall_len = w - pillar_size * 2
+        if wall_len > doorway_width + 4:
+            seg_len = (wall_len - doorway_width) / 2
+            # North wall - two segments
+            self._add_box(x - wall_len/2 + seg_len/2, y + hd - wall_thick/2, z,
+                         seg_len, wall_thick, h)
+            self._add_box(x + wall_len/2 - seg_len/2, y + hd - wall_thick/2, z,
+                         seg_len, wall_thick, h)
+            # South wall - two segments
+            self._add_box(x - wall_len/2 + seg_len/2, y - hd + wall_thick/2, z,
+                         seg_len, wall_thick, h)
+            self._add_box(x + wall_len/2 - seg_len/2, y - hd + wall_thick/2, z,
+                         seg_len, wall_thick, h)
+        
+        # East and West walls
+        wall_len = d - pillar_size * 2
+        if wall_len > doorway_width + 4:
+            seg_len = (wall_len - doorway_width) / 2
+            # East wall
+            self._add_box(x + hw - wall_thick/2, y - wall_len/2 + seg_len/2, z,
+                         wall_thick, seg_len, h)
+            self._add_box(x + hw - wall_thick/2, y + wall_len/2 - seg_len/2, z,
+                         wall_thick, seg_len, h)
+            # West wall
+            self._add_box(x - hw + wall_thick/2, y - wall_len/2 + seg_len/2, z,
+                         wall_thick, seg_len, h)
+            self._add_box(x - hw + wall_thick/2, y + wall_len/2 - seg_len/2, z,
+                         wall_thick, seg_len, h)
+    
+    def add_corridor_geometry(self, room: Room, wall_thick: float = 1.0):
+        """Create corridor with floor and side walls."""
+        x, y, z = room.x, room.y, room.z
+        w, d, h = room.width, room.depth, room.height
+        hw, hd = w / 2, d / 2
+        
+        # Floor
+        self._add_floor(x, y, z, w, d, 1.0)
+        
+        # Determine corridor orientation
+        if w > d:
+            # East-West corridor - walls on north and south
+            self._add_box(x, y + hd - wall_thick/2, z, w, wall_thick, h)
+            self._add_box(x, y - hd + wall_thick/2, z, w, wall_thick, h)
+        else:
+            # North-South corridor - walls on east and west
+            self._add_box(x + hw - wall_thick/2, y, z, wall_thick, d, h)
+            self._add_box(x - hw + wall_thick/2, y, z, wall_thick, d, h)
+    
+    def add_platform(self, x: float, y: float, z: float, w: float, d: float, thick: float = 1.0):
+        """Add a simple platform/floor."""
+        self._add_floor(x, y, z, w, d, thick)
+    
+    def add_ramp(self, x1: float, y1: float, z1: float,
+                 x2: float, y2: float, z2: float,
+                 width: float, thickness: float = 0.5):
+        """Add a ramp between two points."""
+        dx, dy = x2 - x1, y2 - y1
+        length = math.sqrt(dx*dx + dy*dy)
+        if length < 0.01:
+            return
+        
+        # Perpendicular
+        px, py = -dy / length * width / 2, dx / length * width / 2
         
         # Top surface
-        verts_top = [
+        v_top = [
+            self.bm.verts.new((x1 - px, y1 - py, z1)),
+            self.bm.verts.new((x1 + px, y1 + py, z1)),
+            self.bm.verts.new((x2 + px, y2 + py, z2)),
+            self.bm.verts.new((x2 - px, y2 - py, z2)),
+        ]
+        self.bm.faces.new(v_top)
+        
+        # Bottom
+        v_bot = [
+            self.bm.verts.new((x1 - px, y1 - py, z1 - thickness)),
+            self.bm.verts.new((x1 + px, y1 + py, z1 - thickness)),
+            self.bm.verts.new((x2 + px, y2 + py, z2 - thickness)),
+            self.bm.verts.new((x2 - px, y2 - py, z2 - thickness)),
+        ]
+        self.bm.faces.new(v_bot[::-1])
+        
+        # Sides
+        self.bm.faces.new([v_top[0], v_top[3], v_bot[3], v_bot[0]])
+        self.bm.faces.new([v_top[1], v_bot[1], v_bot[2], v_top[2]])
+        self.bm.faces.new([v_top[0], v_bot[0], v_bot[1], v_top[1]])
+        self.bm.faces.new([v_top[2], v_bot[2], v_bot[3], v_top[3]])
+    
+    def _add_floor(self, x: float, y: float, z: float, w: float, d: float, thick: float):
+        """Add a floor slab."""
+        hw, hd = w / 2, d / 2
+        
+        v_top = [
             self.bm.verts.new((x - hw, y - hd, z)),
             self.bm.verts.new((x + hw, y - hd, z)),
             self.bm.verts.new((x + hw, y + hd, z)),
             self.bm.verts.new((x - hw, y + hd, z)),
         ]
-        self.bm.faces.new(verts_top)
-        
-        # Bottom surface
-        z_bot = z - thickness
-        verts_bot = [
-            self.bm.verts.new((x - hw, y + hd, z_bot)),
-            self.bm.verts.new((x + hw, y + hd, z_bot)),
-            self.bm.verts.new((x + hw, y - hd, z_bot)),
-            self.bm.verts.new((x - hw, y - hd, z_bot)),
-        ]
-        self.bm.faces.new(verts_bot)
-        
-        # Side faces
-        for i in range(4):
-            ni = (i + 1) % 4
-            self.bm.faces.new([
-                verts_top[i], verts_top[ni],
-                verts_bot[3-ni], verts_bot[3-i]
-            ])
-    
-    def add_ramp(self,
-                 start_x: float, start_y: float, start_z: float,
-                 end_x: float, end_y: float, end_z: float,
-                 width: float,
-                 thickness: float = 0.5):
-        """Add a ramp between two points."""
-        
-        # Direction vector
-        dx = end_x - start_x
-        dy = end_y - start_y
-        length = math.sqrt(dx*dx + dy*dy)
-        
-        if length < 0.01:
-            return
-        
-        # Perpendicular for width
-        px, py = -dy / length * width / 2, dx / length * width / 2
-        
-        # Top surface vertices
-        v_top = [
-            self.bm.verts.new((start_x - px, start_y - py, start_z)),
-            self.bm.verts.new((start_x + px, start_y + py, start_z)),
-            self.bm.verts.new((end_x + px, end_y + py, end_z)),
-            self.bm.verts.new((end_x - px, end_y - py, end_z)),
-        ]
         self.bm.faces.new(v_top)
         
-        # Bottom surface
         v_bot = [
-            self.bm.verts.new((start_x - px, start_y - py, start_z - thickness)),
-            self.bm.verts.new((start_x + px, start_y + py, start_z - thickness)),
-            self.bm.verts.new((end_x + px, end_y + py, end_z - thickness)),
-            self.bm.verts.new((end_x - px, end_y - py, end_z - thickness)),
+            self.bm.verts.new((x - hw, y + hd, z - thick)),
+            self.bm.verts.new((x + hw, y + hd, z - thick)),
+            self.bm.verts.new((x + hw, y - hd, z - thick)),
+            self.bm.verts.new((x - hw, y - hd, z - thick)),
         ]
+        self.bm.faces.new(v_bot)
+        
+        # Edges
+        for i in range(4):
+            ni = (i + 1) % 4
+            self.bm.faces.new([v_top[i], v_top[ni], v_bot[3-ni], v_bot[3-i]])
+    
+    def _add_box(self, x: float, y: float, z: float, w: float, d: float, h: float):
+        """Add a solid box."""
+        hw, hd = w / 2, d / 2
+        
+        v_bot = [
+            self.bm.verts.new((x - hw, y - hd, z)),
+            self.bm.verts.new((x + hw, y - hd, z)),
+            self.bm.verts.new((x + hw, y + hd, z)),
+            self.bm.verts.new((x - hw, y + hd, z)),
+        ]
+        
+        v_top = [
+            self.bm.verts.new((x - hw, y - hd, z + h)),
+            self.bm.verts.new((x + hw, y - hd, z + h)),
+            self.bm.verts.new((x + hw, y + hd, z + h)),
+            self.bm.verts.new((x - hw, y + hd, z + h)),
+        ]
+        
         self.bm.faces.new(v_bot[::-1])
-        
-        # Side walls
-        # Left side
-        self.bm.faces.new([v_top[0], v_top[3], v_bot[3], v_bot[0]])
-        # Right side
-        self.bm.faces.new([v_top[1], v_bot[1], v_bot[2], v_top[2]])
-        # Start cap
-        self.bm.faces.new([v_top[0], v_bot[0], v_bot[1], v_top[1]])
-        # End cap
-        self.bm.faces.new([v_top[2], v_bot[2], v_bot[3], v_top[3]])
-    
-    def add_wall_section(self,
-                         x1: float, y1: float, z1: float,
-                         x2: float, y2: float, z2: float,
-                         height: float,
-                         thickness: float = 0.5):
-        """Add a wall section (can be sloped in XY and/or Z)."""
-        
-        # Direction in XY
-        dx = x2 - x1
-        dy = y2 - y1
-        length = math.sqrt(dx*dx + dy*dy)
-        
-        if length < 0.01:
-            return
-        
-        # Perpendicular for thickness
-        nx, ny = -dy / length * thickness / 2, dx / length * thickness / 2
-        
-        # Four corners at bottom
-        v_b1 = self.bm.verts.new((x1 - nx, y1 - ny, z1))
-        v_b2 = self.bm.verts.new((x1 + nx, y1 + ny, z1))
-        v_b3 = self.bm.verts.new((x2 + nx, y2 + ny, z2))
-        v_b4 = self.bm.verts.new((x2 - nx, y2 - ny, z2))
-        
-        # Four corners at top
-        v_t1 = self.bm.verts.new((x1 - nx, y1 - ny, z1 + height))
-        v_t2 = self.bm.verts.new((x1 + nx, y1 + ny, z1 + height))
-        v_t3 = self.bm.verts.new((x2 + nx, y2 + ny, z2 + height))
-        v_t4 = self.bm.verts.new((x2 - nx, y2 - ny, z2 + height))
-        
-        # Faces
-        self.bm.faces.new([v_b1, v_b2, v_b3, v_b4])  # Bottom
-        self.bm.faces.new([v_t4, v_t3, v_t2, v_t1])  # Top
-        self.bm.faces.new([v_b1, v_b4, v_t4, v_t1])  # Outer
-        self.bm.faces.new([v_b2, v_t2, v_t3, v_b3])  # Inner
-        self.bm.faces.new([v_b1, v_t1, v_t2, v_b2])  # Start
-        self.bm.faces.new([v_b3, v_t3, v_t4, v_b4])  # End
-    
-    def add_column(self, x: float, y: float, z_base: float, z_top: float, radius: float, sides: int = 8):
-        """Add a column/pillar."""
-        verts_bottom = []
-        verts_top = []
-        
-        for i in range(sides):
-            angle = 2 * math.pi * i / sides
-            px = x + radius * math.cos(angle)
-            py = y + radius * math.sin(angle)
-            
-            verts_bottom.append(self.bm.verts.new((px, py, z_base)))
-            verts_top.append(self.bm.verts.new((px, py, z_top)))
-        
-        # Bottom cap
-        self.bm.faces.new(verts_bottom[::-1])
-        # Top cap
-        self.bm.faces.new(verts_top)
-        
-        # Sides
-        for i in range(sides):
-            ni = (i + 1) % sides
-            self.bm.faces.new([
-                verts_bottom[i], verts_bottom[ni],
-                verts_top[ni], verts_top[i]
-            ])
-    
-    # =========================================================================
-    # FINALIZE
-    # =========================================================================
+        self.bm.faces.new(v_top)
+        for i in range(4):
+            ni = (i + 1) % 4
+            self.bm.faces.new([v_bot[i], v_bot[ni], v_top[ni], v_top[i]])
     
     def finalize(self, collection) -> bpy.types.Object:
         """Create the Blender object."""
@@ -308,48 +665,63 @@ class MeshBuilder:
         
         obj = bpy.data.objects.new(self.name, mesh)
         collection.objects.link(obj)
-        
         return obj
 
 
 # =============================================================================
-# BASE GENERATOR - FORM FIRST APPROACH
+# BASE GENERATOR
 # =============================================================================
 
 class TribesBaseGenerator:
-    """
-    Generates Tribes-style bases using a form-first approach:
-    1. Create exterior shell with sloped walls
-    2. Create interior atrium space
-    3. Add platforms at multiple levels
-    4. Add ramps connecting levels
-    5. Add entrances
-    """
+    """Generates complete Tribes-style bases."""
     
     def __init__(self, cfg: Config = None):
         self.cfg = cfg or Config()
         self.collection = None
+        self.rooms: List[Room] = []
         random.seed(self.cfg.seed)
     
     def generate(self):
         """Generate the complete base."""
         print("\n" + "="*60)
-        print("FPSZ BASE GENERATOR v4 - Form First")
+        print("FPSZ BASE GENERATOR v5 - Complex Interiors")
         print(f"Style: {self.cfg.style.value}")
+        print(f"Seed: {self.cfg.seed}")
         print("="*60)
         
         self._setup_collection()
         
-        if self.cfg.style == BaseStyle.PYRAMID:
-            self._generate_pyramid_base()
-        elif self.cfg.style == BaseStyle.STEPPED_PYRAMID:
-            self._generate_stepped_base()
-        elif self.cfg.style == BaseStyle.TOWER_ON_BASE:
-            self._generate_tower_base()
-        else:
-            self._generate_bunker_base()
+        # Generate interior layout
+        print("\n1. Generating interior layout...")
+        layout_gen = InteriorLayout(self.cfg)
+        self.rooms = layout_gen.generate_layout()
+        print(f"   Created {len(self.rooms)} rooms across {self.cfg.num_levels} levels")
         
-        print("\nGeneration complete!")
+        # Build exterior shell
+        print("\n2. Building exterior shell...")
+        self._build_exterior()
+        
+        # Build interior rooms
+        print("\n3. Building interior rooms...")
+        self._build_interior()
+        
+        # Build ramps
+        print("\n4. Building ramps...")
+        self._build_ramps()
+        
+        # Build entrances
+        print("\n5. Building entrances...")
+        self._build_entrances()
+        
+        print("\n" + "="*60)
+        print("Generation complete!")
+        print(f"Total rooms: {len(self.rooms)}")
+        
+        # Room breakdown
+        from collections import Counter
+        room_counts = Counter(r.room_type.value for r in self.rooms)
+        for rtype, count in room_counts.items():
+            print(f"  {rtype}: {count}")
         print("="*60 + "\n")
     
     def _setup_collection(self):
@@ -366,508 +738,189 @@ class TribesBaseGenerator:
         bpy.context.scene.collection.children.link(col)
         self.collection = col
     
-    # =========================================================================
-    # PYRAMID STYLE
-    # =========================================================================
+    def _build_exterior(self):
+        """Build the exterior shell."""
+        cfg = self.cfg
+        mb = MeshBuilder("Base_Exterior")
+        
+        taper_amount = cfg.base_height * cfg.wall_taper
+        top_w = cfg.base_width - taper_amount * 2
+        top_d = cfg.base_depth - taper_amount * 2
+        
+        if cfg.style == BaseStyle.PYRAMID:
+            mb.add_tapered_shell(
+                cfg.base_width, cfg.base_depth,
+                top_w, top_d,
+                cfg.base_height,
+                cfg.wall_thickness
+            )
+        
+        elif cfg.style == BaseStyle.STEPPED_PYRAMID:
+            # Multiple tiers
+            num_tiers = 4
+            tier_h = cfg.base_height / num_tiers
+            
+            for tier in range(num_tiers):
+                scale = 1.0 - tier * 0.18
+                tier_w = cfg.base_width * scale
+                tier_d = cfg.base_depth * scale
+                top_scale = scale - 0.04
+                tier_top_w = cfg.base_width * top_scale
+                tier_top_d = cfg.base_depth * top_scale
+                
+                mb.add_tapered_shell(
+                    tier_w, tier_d,
+                    tier_top_w, tier_top_d,
+                    tier_h,
+                    cfg.wall_thickness,
+                    base_z=tier * tier_h
+                )
+        
+        elif cfg.style == BaseStyle.TOWER_ON_BASE:
+            # Wide base
+            base_h = cfg.base_height * 0.35
+            mb.add_tapered_shell(
+                cfg.base_width * 1.2, cfg.base_depth * 1.2,
+                cfg.base_width * 1.1, cfg.base_depth * 1.1,
+                base_h,
+                cfg.wall_thickness
+            )
+            # Tower
+            tower_h = cfg.base_height * 0.65
+            mb.add_tapered_shell(
+                cfg.base_width * 0.6, cfg.base_depth * 0.6,
+                cfg.base_width * 0.5, cfg.base_depth * 0.5,
+                tower_h,
+                cfg.wall_thickness,
+                base_z=base_h
+            )
+        
+        obj = mb.finalize(self.collection)
+        self._apply_material(obj, "Exterior", (0.42, 0.44, 0.47))
     
-    def _generate_pyramid_base(self):
-        """Generate classic pyramid-style base with sloped walls."""
+    def _build_interior(self):
+        """Build interior room geometry."""
         cfg = self.cfg
         
-        print("\n1. Creating exterior shell...")
-        mb_exterior = MeshBuilder("Base_Exterior")
+        # Group rooms by type for separate objects
+        mb_floors = MeshBuilder("Base_Floors")
+        mb_walls = MeshBuilder("Base_Walls")
         
-        # Calculate top dimensions based on taper
-        taper_amount = cfg.base_height * cfg.wall_taper
-        top_width = cfg.base_width - taper_amount * 2
-        top_depth = cfg.base_depth - taper_amount * 2
+        for room in self.rooms:
+            if room.room_type == RoomType.CORRIDOR:
+                mb_floors.add_corridor_geometry(room, cfg.interior_wall_thickness)
+            elif room.room_type == RoomType.BALCONY:
+                # Balconies are just platforms
+                mb_floors.add_platform(room.x, room.y, room.z, room.width, room.depth, 1.0)
+            else:
+                mb_floors.add_room_geometry(room, cfg.interior_wall_thickness)
         
-        # Exterior tapered shell
-        mb_exterior.add_tapered_box(
-            cfg.base_width, cfg.base_depth,
-            top_width, top_depth,
-            cfg.base_height,
-            base_z=0
-        )
-        
-        exterior_obj = mb_exterior.finalize(self.collection)
-        self._apply_material(exterior_obj, "Exterior", (0.45, 0.47, 0.5))
-        
-        print("2. Creating interior spaces...")
-        mb_interior = MeshBuilder("Base_Interior")
-        
-        # Interior floors at each level
-        interior_width = cfg.base_width - cfg.wall_thickness * 2
-        interior_depth = cfg.base_depth - cfg.wall_thickness * 2
-        
-        for level in range(cfg.num_levels):
-            z = level * cfg.level_height + cfg.floor_thickness
-            
-            # Calculate interior size at this height (accounting for taper)
-            height_ratio = z / cfg.base_height
-            taper_at_level = taper_amount * height_ratio
-            level_width = interior_width - taper_at_level * 2
-            level_depth = interior_depth - taper_at_level * 2
-            
-            # Don't create floor for atrium area in center
-            # Instead, create floor sections around the perimeter
-            
-            # Platform depth (how far from wall)
-            platform_d = (level_depth - cfg.atrium_depth) / 2
-            platform_w = (level_width - cfg.atrium_width) / 2
-            
-            if platform_d > 2 and platform_w > 2:
-                # North platform
-                mb_interior.add_platform(
-                    0, level_depth/2 - platform_d/2, z,
-                    level_width, platform_d, cfg.floor_thickness
-                )
-                
-                # South platform
-                mb_interior.add_platform(
-                    0, -(level_depth/2 - platform_d/2), z,
-                    level_width, platform_d, cfg.floor_thickness
-                )
-                
-                # East platform (connecting north-south)
-                mb_interior.add_platform(
-                    level_width/2 - platform_w/2, 0, z,
-                    platform_w, cfg.atrium_depth, cfg.floor_thickness
-                )
-                
-                # West platform (connecting north-south)
-                mb_interior.add_platform(
-                    -(level_width/2 - platform_w/2), 0, z,
-                    platform_w, cfg.atrium_depth, cfg.floor_thickness
-                )
-        
-        # Ground floor (solid)
-        mb_interior.add_platform(0, 0, cfg.floor_thickness, 
-                                 interior_width * 0.9, interior_depth * 0.9, 
-                                 cfg.floor_thickness)
-        
-        interior_obj = mb_interior.finalize(self.collection)
-        self._apply_material(interior_obj, "Floor", (0.35, 0.38, 0.4))
-        
-        print("3. Creating ramps...")
-        self._add_interior_ramps(cfg)
-        
-        print("4. Creating entrances...")
-        self._add_entrances_pyramid(cfg, taper_amount)
-        
-        print("5. Adding details...")
-        self._add_columns(cfg)
+        floor_obj = mb_floors.finalize(self.collection)
+        self._apply_material(floor_obj, "Floor", (0.35, 0.37, 0.4))
     
-    def _add_interior_ramps(self, cfg: Config):
-        """Add ramps connecting levels inside."""
-        mb_ramps = MeshBuilder("Base_Ramps")
+    def _build_ramps(self):
+        """Build ramps connecting levels."""
+        cfg = self.cfg
+        mb = MeshBuilder("Base_Ramps")
         
         ramp_rise = cfg.level_height
         ramp_run = ramp_rise / math.tan(math.radians(cfg.ramp_angle))
         
+        # Find main halls/corridors on each level for ramp placement
+        rooms_by_level = {}
+        for room in self.rooms:
+            if room.level not in rooms_by_level:
+                rooms_by_level[room.level] = []
+            rooms_by_level[room.level].append(room)
+        
+        # Place ramps between levels
         for level in range(cfg.num_levels - 1):
             z_start = (level + 1) * cfg.level_height + cfg.floor_thickness
             z_end = z_start + ramp_rise
             
-            # Alternate ramp positions
-            if level % 2 == 0:
-                # Ramp on east side going north
-                start_x = cfg.atrium_width / 2 + 2
-                start_y = -ramp_run / 2
-                end_y = ramp_run / 2
-                mb_ramps.add_ramp(start_x, start_y, z_start,
-                                  start_x, end_y, z_end,
-                                  cfg.ramp_width)
+            # Alternate ramp positions for variety
+            if level % 4 == 0:
+                # East side, going north
+                x = 12
+                y_start, y_end = -ramp_run/2, ramp_run/2
+            elif level % 4 == 1:
+                # West side, going south
+                x = -12
+                y_start, y_end = ramp_run/2, -ramp_run/2
+            elif level % 4 == 2:
+                # North side, going east
+                x_start, x_end = -ramp_run/2, ramp_run/2
+                y = 12
+                mb.add_ramp(x_start, y, z_start, x_end, y, z_end, cfg.ramp_width)
+                continue
             else:
-                # Ramp on west side going south
-                start_x = -(cfg.atrium_width / 2 + 2)
-                start_y = ramp_run / 2
-                end_y = -ramp_run / 2
-                mb_ramps.add_ramp(start_x, start_y, z_start,
-                                  start_x, end_y, z_end,
-                                  cfg.ramp_width)
+                # South side, going west
+                x_start, x_end = ramp_run/2, -ramp_run/2
+                y = -12
+                mb.add_ramp(x_start, y, z_start, x_end, y, z_end, cfg.ramp_width)
+                continue
+            
+            mb.add_ramp(x, y_start, z_start, x, y_end, z_end, cfg.ramp_width)
         
-        ramps_obj = mb_ramps.finalize(self.collection)
-        self._apply_material(ramps_obj, "Ramp", (0.5, 0.45, 0.35))
+        obj = mb.finalize(self.collection)
+        self._apply_material(obj, "Ramp", (0.48, 0.43, 0.35))
     
-    def _add_entrances_pyramid(self, cfg: Config, taper_amount: float):
-        """Add entrance ramps to pyramid base."""
-        mb_entrance = MeshBuilder("Base_Entrances")
+    def _build_entrances(self):
+        """Build entrance ramps."""
+        cfg = self.cfg
+        mb = MeshBuilder("Base_Entrances")
         
-        # Entrance height (slightly above ground)
-        entrance_z = cfg.level_height * 0.5
+        # Entrance height
+        entrance_z = cfg.level_height * 0.4
         
-        # Calculate wall position at entrance height
-        taper_at_entrance = taper_amount * (entrance_z / cfg.base_height)
+        # Calculate wall position
+        taper_at_entrance = cfg.base_height * cfg.wall_taper * (entrance_z / cfg.base_height)
         wall_offset = cfg.base_depth / 2 - taper_at_entrance
         
-        # Ramp from ground to entrance
-        ramp_length = entrance_z / math.tan(math.radians(cfg.ramp_angle))
+        # Ramp length
+        ramp_len = entrance_z / math.tan(math.radians(22))
         
-        # South entrance ramp
-        mb_entrance.add_ramp(
-            0, -(wall_offset + ramp_length), 0,
-            0, -wall_offset, entrance_z,
+        # South entrance
+        mb.add_ramp(
+            0, -(wall_offset + ramp_len + 2), 0,
+            0, -wall_offset + 4, entrance_z,
             cfg.entrance_width, 1.0
         )
         
-        # North entrance ramp
-        mb_entrance.add_ramp(
-            0, wall_offset + ramp_length, 0,
-            0, wall_offset, entrance_z,
+        # Landing platform
+        mb.add_platform(0, -wall_offset + 6, entrance_z, cfg.entrance_width + 6, 8, 1.0)
+        
+        # North entrance
+        mb.add_ramp(
+            0, wall_offset + ramp_len + 2, 0,
+            0, wall_offset - 4, entrance_z,
             cfg.entrance_width, 1.0
         )
+        mb.add_platform(0, wall_offset - 6, entrance_z, cfg.entrance_width + 6, 8, 1.0)
         
-        # Entrance platforms
-        mb_entrance.add_platform(0, -(wall_offset - 2), entrance_z,
-                                 cfg.entrance_width + 4, 6, 1.0)
-        mb_entrance.add_platform(0, wall_offset - 2, entrance_z,
-                                 cfg.entrance_width + 4, 6, 1.0)
-        
-        entrance_obj = mb_entrance.finalize(self.collection)
-        self._apply_material(entrance_obj, "Entrance", (0.5, 0.45, 0.35))
-    
-    def _add_columns(self, cfg: Config):
-        """Add decorative/structural columns."""
-        mb_columns = MeshBuilder("Base_Columns")
-        
-        # Columns at corners of atrium
-        col_positions = [
-            (cfg.atrium_width/2 + 1, cfg.atrium_depth/2 + 1),
-            (cfg.atrium_width/2 + 1, -(cfg.atrium_depth/2 + 1)),
-            (-(cfg.atrium_width/2 + 1), cfg.atrium_depth/2 + 1),
-            (-(cfg.atrium_width/2 + 1), -(cfg.atrium_depth/2 + 1)),
-        ]
-        
-        for x, y in col_positions:
-            mb_columns.add_column(x, y, cfg.floor_thickness, 
-                                  cfg.base_height - 4, 1.5, 8)
-        
-        columns_obj = mb_columns.finalize(self.collection)
-        self._apply_material(columns_obj, "Column", (0.3, 0.32, 0.35))
-    
-    # =========================================================================
-    # STEPPED PYRAMID STYLE
-    # =========================================================================
-    
-    def _generate_stepped_base(self):
-        """Generate stepped/terraced pyramid base."""
-        cfg = self.cfg
-        
-        print("\n1. Creating stepped exterior...")
-        mb_exterior = MeshBuilder("Base_Exterior")
-        
-        # Create multiple tiers
-        num_tiers = 4
-        tier_height = cfg.base_height / num_tiers
-        
-        for tier in range(num_tiers):
-            # Each tier is smaller than the one below
-            scale = 1.0 - (tier * 0.2)
-            tier_width = cfg.base_width * scale
-            tier_depth = cfg.base_depth * scale
+        # Optional side entrances
+        if cfg.num_entrances > 2:
+            side_offset = cfg.base_width / 2 - taper_at_entrance
             
-            # Slight taper within each tier
-            top_scale = scale - 0.05
-            top_width = cfg.base_width * top_scale
-            top_depth = cfg.base_depth * top_scale
+            # East
+            mb.add_ramp(
+                side_offset + ramp_len + 2, 0, 0,
+                side_offset - 4, 0, entrance_z,
+                cfg.entrance_width * 0.8, 1.0
+            )
             
-            z_base = tier * tier_height
-            
-            mb_exterior.add_tapered_box(
-                tier_width, tier_depth,
-                top_width, top_depth,
-                tier_height,
-                base_z=z_base
+            # West
+            mb.add_ramp(
+                -(side_offset + ramp_len + 2), 0, 0,
+                -(side_offset - 4), 0, entrance_z,
+                cfg.entrance_width * 0.8, 1.0
             )
         
-        exterior_obj = mb_exterior.finalize(self.collection)
-        self._apply_material(exterior_obj, "Exterior", (0.45, 0.47, 0.5))
-        
-        print("2. Creating interior...")
-        self._create_stepped_interior(cfg, num_tiers, tier_height)
-        
-        print("3. Creating ramps...")
-        self._add_interior_ramps(cfg)
-        
-        print("4. Adding entrance ramps...")
-        self._add_stepped_entrances(cfg, tier_height)
-    
-    def _create_stepped_interior(self, cfg: Config, num_tiers: int, tier_height: float):
-        """Create interior for stepped base."""
-        mb_interior = MeshBuilder("Base_Interior")
-        
-        for tier in range(num_tiers):
-            scale = 1.0 - (tier * 0.2)
-            tier_width = (cfg.base_width - cfg.wall_thickness * 2) * scale
-            tier_depth = (cfg.base_depth - cfg.wall_thickness * 2) * scale
-            z = tier * tier_height + cfg.floor_thickness
-            
-            # Ring platform around atrium
-            platform_width = (tier_width - cfg.atrium_width) / 2
-            
-            if platform_width > 3:
-                # Create perimeter platforms
-                # North
-                mb_interior.add_platform(
-                    0, tier_depth/2 - platform_width/2, z,
-                    tier_width, platform_width, cfg.floor_thickness
-                )
-                # South
-                mb_interior.add_platform(
-                    0, -(tier_depth/2 - platform_width/2), z,
-                    tier_width, platform_width, cfg.floor_thickness
-                )
-                # East
-                mb_interior.add_platform(
-                    tier_width/2 - platform_width/2, 0, z,
-                    platform_width, cfg.atrium_depth, cfg.floor_thickness
-                )
-                # West
-                mb_interior.add_platform(
-                    -(tier_width/2 - platform_width/2), 0, z,
-                    platform_width, cfg.atrium_depth, cfg.floor_thickness
-                )
-        
-        interior_obj = mb_interior.finalize(self.collection)
-        self._apply_material(interior_obj, "Floor", (0.35, 0.38, 0.4))
-    
-    def _add_stepped_entrances(self, cfg: Config, tier_height: float):
-        """Add entrances for stepped base."""
-        mb_entrance = MeshBuilder("Base_Entrances")
-        
-        # External ramp on first tier
-        ramp_length = tier_height / math.tan(math.radians(25))
-        
-        mb_entrance.add_ramp(
-            0, -(cfg.base_depth/2 + ramp_length), 0,
-            0, -cfg.base_depth/2 + 4, tier_height,
-            cfg.entrance_width, 1.0
-        )
-        
-        mb_entrance.add_ramp(
-            0, cfg.base_depth/2 + ramp_length, 0,
-            0, cfg.base_depth/2 - 4, tier_height,
-            cfg.entrance_width, 1.0
-        )
-        
-        entrance_obj = mb_entrance.finalize(self.collection)
-        self._apply_material(entrance_obj, "Entrance", (0.5, 0.45, 0.35))
-    
-    # =========================================================================
-    # TOWER ON BASE STYLE
-    # =========================================================================
-    
-    def _generate_tower_base(self):
-        """Generate tower-on-base style."""
-        cfg = self.cfg
-        
-        print("\n1. Creating base platform...")
-        mb_base = MeshBuilder("Base_Platform")
-        
-        # Wide base platform
-        base_height = cfg.base_height * 0.3
-        mb_base.add_tapered_box(
-            cfg.base_width, cfg.base_depth,
-            cfg.base_width * 0.9, cfg.base_depth * 0.9,
-            base_height,
-            base_z=0
-        )
-        
-        base_obj = mb_base.finalize(self.collection)
-        self._apply_material(base_obj, "BasePlatform", (0.4, 0.42, 0.45))
-        
-        print("2. Creating tower...")
-        mb_tower = MeshBuilder("Base_Tower")
-        
-        # Narrower tower on top
-        tower_width = cfg.base_width * 0.5
-        tower_depth = cfg.base_depth * 0.5
-        tower_height = cfg.base_height * 0.7
-        
-        mb_tower.add_tapered_box(
-            tower_width, tower_depth,
-            tower_width * 0.85, tower_depth * 0.85,
-            tower_height,
-            base_z=base_height
-        )
-        
-        tower_obj = mb_tower.finalize(self.collection)
-        self._apply_material(tower_obj, "Tower", (0.5, 0.52, 0.55))
-        
-        print("3. Creating interior...")
-        self._create_tower_interior(cfg, base_height, tower_width, tower_depth, tower_height)
-        
-        print("4. Creating entrances...")
-        self._add_tower_entrances(cfg, base_height)
-    
-    def _create_tower_interior(self, cfg: Config, base_height: float,
-                               tower_width: float, tower_depth: float, tower_height: float):
-        """Create interior for tower base."""
-        mb_interior = MeshBuilder("Base_Interior")
-        
-        # Base platform interior
-        mb_interior.add_platform(0, 0, cfg.floor_thickness,
-                                 cfg.base_width - cfg.wall_thickness * 2,
-                                 cfg.base_depth - cfg.wall_thickness * 2,
-                                 cfg.floor_thickness)
-        
-        # Tower levels
-        tower_levels = 3
-        level_height = tower_height / tower_levels
-        
-        for level in range(tower_levels):
-            z = base_height + level * level_height + cfg.floor_thickness
-            
-            interior_w = tower_width - cfg.wall_thickness * 2
-            interior_d = tower_depth - cfg.wall_thickness * 2
-            
-            # Perimeter platform with central opening
-            platform_w = (interior_w - cfg.atrium_width * 0.6) / 2
-            
-            if platform_w > 2:
-                mb_interior.add_platform(
-                    0, interior_d/2 - platform_w/2, z,
-                    interior_w, platform_w, cfg.floor_thickness
-                )
-                mb_interior.add_platform(
-                    0, -(interior_d/2 - platform_w/2), z,
-                    interior_w, platform_w, cfg.floor_thickness
-                )
-        
-        interior_obj = mb_interior.finalize(self.collection)
-        self._apply_material(interior_obj, "Floor", (0.35, 0.38, 0.4))
-        
-        # Tower ramps
-        mb_ramps = MeshBuilder("Tower_Ramps")
-        ramp_rise = level_height
-        ramp_run = ramp_rise / math.tan(math.radians(cfg.ramp_angle))
-        
-        for level in range(tower_levels - 1):
-            z_start = base_height + (level + 1) * level_height + cfg.floor_thickness
-            z_end = z_start + ramp_rise
-            
-            side = 1 if level % 2 == 0 else -1
-            mb_ramps.add_ramp(
-                side * (cfg.atrium_width * 0.2), -ramp_run/2, z_start,
-                side * (cfg.atrium_width * 0.2), ramp_run/2, z_end,
-                cfg.ramp_width * 0.8
-            )
-        
-        ramps_obj = mb_ramps.finalize(self.collection)
-        self._apply_material(ramps_obj, "Ramp", (0.5, 0.45, 0.35))
-    
-    def _add_tower_entrances(self, cfg: Config, base_height: float):
-        """Add entrances for tower base."""
-        mb_entrance = MeshBuilder("Base_Entrances")
-        
-        # Ramps up to base platform
-        ramp_length = base_height / math.tan(math.radians(20))
-        
-        mb_entrance.add_ramp(
-            0, -(cfg.base_depth/2 + ramp_length), 0,
-            0, -cfg.base_depth/2 + 2, base_height,
-            cfg.entrance_width, 1.0
-        )
-        
-        mb_entrance.add_ramp(
-            0, cfg.base_depth/2 + ramp_length, 0,
-            0, cfg.base_depth/2 - 2, base_height,
-            cfg.entrance_width, 1.0
-        )
-        
-        entrance_obj = mb_entrance.finalize(self.collection)
-        self._apply_material(entrance_obj, "Entrance", (0.5, 0.45, 0.35))
-    
-    # =========================================================================
-    # BUNKER STYLE
-    # =========================================================================
-    
-    def _generate_bunker_base(self):
-        """Generate low, wide bunker style."""
-        cfg = self.cfg
-        
-        print("\n1. Creating bunker shell...")
-        mb_exterior = MeshBuilder("Base_Exterior")
-        
-        # Wide, low profile
-        bunker_height = cfg.base_height * 0.4
-        
-        mb_exterior.add_tapered_box(
-            cfg.base_width * 1.2, cfg.base_depth * 1.2,
-            cfg.base_width, cfg.base_depth,
-            bunker_height,
-            base_z=0
-        )
-        
-        exterior_obj = mb_exterior.finalize(self.collection)
-        self._apply_material(exterior_obj, "Exterior", (0.4, 0.42, 0.4))
-        
-        print("2. Creating interior...")
-        mb_interior = MeshBuilder("Base_Interior")
-        
-        # Two level interior
-        interior_w = cfg.base_width - cfg.wall_thickness * 2
-        interior_d = cfg.base_depth - cfg.wall_thickness * 2
-        
-        # Ground floor
-        mb_interior.add_platform(0, 0, cfg.floor_thickness,
-                                 interior_w, interior_d, cfg.floor_thickness)
-        
-        # Upper balconies along walls
-        balcony_z = bunker_height * 0.5
-        balcony_width = 6
-        
-        mb_interior.add_platform(0, interior_d/2 - balcony_width/2, balcony_z,
-                                 interior_w * 0.8, balcony_width, cfg.floor_thickness)
-        mb_interior.add_platform(0, -(interior_d/2 - balcony_width/2), balcony_z,
-                                 interior_w * 0.8, balcony_width, cfg.floor_thickness)
-        
-        interior_obj = mb_interior.finalize(self.collection)
-        self._apply_material(interior_obj, "Floor", (0.35, 0.38, 0.4))
-        
-        print("3. Creating ramps...")
-        mb_ramps = MeshBuilder("Base_Ramps")
-        
-        # Ramps to balconies
-        ramp_rise = balcony_z - cfg.floor_thickness
-        ramp_run = ramp_rise / math.tan(math.radians(cfg.ramp_angle))
-        
-        mb_ramps.add_ramp(
-            interior_w/2 - 4, interior_d/2 - balcony_width - ramp_run, cfg.floor_thickness,
-            interior_w/2 - 4, interior_d/2 - balcony_width, balcony_z,
-            cfg.ramp_width
-        )
-        
-        mb_ramps.add_ramp(
-            -(interior_w/2 - 4), -(interior_d/2 - balcony_width - ramp_run), cfg.floor_thickness,
-            -(interior_w/2 - 4), -(interior_d/2 - balcony_width), balcony_z,
-            cfg.ramp_width
-        )
-        
-        ramps_obj = mb_ramps.finalize(self.collection)
-        self._apply_material(ramps_obj, "Ramp", (0.5, 0.45, 0.35))
-        
-        print("4. Creating entrances...")
-        mb_entrance = MeshBuilder("Base_Entrances")
-        
-        # Ground level entrances
-        entrance_y = cfg.base_depth * 0.6
-        
-        mb_entrance.add_platform(0, -entrance_y, cfg.floor_thickness,
-                                 cfg.entrance_width + 4, 8, cfg.floor_thickness)
-        mb_entrance.add_platform(0, entrance_y, cfg.floor_thickness,
-                                 cfg.entrance_width + 4, 8, cfg.floor_thickness)
-        
-        entrance_obj = mb_entrance.finalize(self.collection)
-        self._apply_material(entrance_obj, "Entrance", (0.5, 0.45, 0.35))
-    
-    # =========================================================================
-    # UTILITIES
-    # =========================================================================
+        obj = mb.finalize(self.collection)
+        self._apply_material(obj, "Entrance", (0.48, 0.43, 0.35))
     
     def _apply_material(self, obj: bpy.types.Object, name: str, color: Tuple[float, float, float]):
-        """Apply or create a material."""
+        """Apply material to object."""
         mat_name = f"FPSZ_{name}"
         mat = bpy.data.materials.get(mat_name)
         
@@ -889,51 +942,63 @@ class TribesBaseGenerator:
 # MAIN
 # =============================================================================
 
-def generate_base(style: str = "pyramid", seed: int = None, **kwargs):
+def generate_base(style: str = "pyramid", seed: int = None, num_levels: int = 4, **kwargs):
     """
     Generate a Tribes-style base.
     
     Args:
-        style: "pyramid", "stepped", "tower", or "bunker"
-        seed: Random seed for reproducibility
+        style: "pyramid", "stepped", or "tower"
+        seed: Random seed (None for random)
+        num_levels: Number of interior levels (2-6)
         **kwargs: Override any Config parameter
     """
     cfg = Config()
     
-    # Set style
+    # Style
     style_map = {
         "pyramid": BaseStyle.PYRAMID,
         "stepped": BaseStyle.STEPPED_PYRAMID,
         "tower": BaseStyle.TOWER_ON_BASE,
-        "bunker": BaseStyle.BUNKER,
     }
     cfg.style = style_map.get(style.lower(), BaseStyle.PYRAMID)
     
-    # Set seed
+    # Seed
     if seed is not None:
         cfg.seed = seed
     else:
         import time
-        cfg.seed = int(time.time()) % 10000
+        cfg.seed = int(time.time()) % 100000
     
-    # Apply any overrides
+    # Levels
+    cfg.num_levels = max(2, min(6, num_levels))
+    cfg.base_height = cfg.num_levels * cfg.level_height + 8
+    
+    # Overrides
     for key, value in kwargs.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
-    
-    print(f"Using seed: {cfg.seed}")
     
     generator = TribesBaseGenerator(cfg)
     generator.generate()
 
 
-if __name__ == "__main__":
-    # Generate random style
+def quick_generate():
+    """Quick generation with random settings."""
     import time
-    seed = int(time.time()) % 10000
-    
-    styles = ["pyramid", "stepped", "tower", "bunker"]
+    seed = int(time.time()) % 100000
+    styles = ["pyramid", "stepped", "tower"]
     style = random.choice(styles)
+    levels = random.randint(3, 5)
     
-    print(f"\nGenerating {style} base...")
-    generate_base(style=style, seed=seed)
+    print(f"\nQuick generate: {style}, {levels} levels, seed={seed}")
+    generate_base(style=style, seed=seed, num_levels=levels)
+
+
+if __name__ == "__main__":
+    # Generate a pyramid base with 4 levels
+    generate_base(style="pyramid", seed=12345, num_levels=4)
+    
+    # Or try these:
+    # generate_base(style="stepped", seed=54321, num_levels=5)
+    # generate_base(style="tower", seed=11111, num_levels=4)
+    # quick_generate()  # Random style and levels
